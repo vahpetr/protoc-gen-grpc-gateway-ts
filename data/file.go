@@ -30,10 +30,26 @@ type File struct {
 	EnableStylingCheck bool
 }
 
+func depsFilter(deps []*Dependency, criteria func(dep *Dependency) bool) []*Dependency {
+	result := []*Dependency{}
+	for _, dep := range deps {
+		if criteria(dep) {
+			result = append(result, dep)
+		}
+	}
+	return result
+}
+
+func isNotGoogleDeps(dep *Dependency) bool {
+	return dep.ModuleIdentifier != "GoogleProtobufTimestamp" &&
+		dep.ModuleIdentifier != "GoogleProtobufWrappers"
+}
+
 // StableDependencies are dependencies in a stable order.
 func (f *File) StableDependencies() []*Dependency {
-	out := make([]*Dependency, len(f.Dependencies))
-	copy(out, f.Dependencies)
+	deps := depsFilter(f.Dependencies, isNotGoogleDeps)
+	out := make([]*Dependency, len(deps))
+	copy(out, deps)
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].SourceFile < out[j].SourceFile
 	})
@@ -121,8 +137,14 @@ type Type interface {
 type TypeInfo struct {
 	// Type
 	Type string
-	// IsRepeated indicates whether this field is a repeated field
+	// IsRepeated indicates whether this type is a repeated field
 	IsRepeated bool
-	// IsExternal indicates whether this type is external
+	// IsExternal indicates whether this type is a external field
 	IsExternal bool
+	// IsOneOfField tells whether this field is part of a one of field.
+	// one of fields will have extra method clearXXX,
+	// and the setter accessor will clear out other fields in the group on set
+	IsOneOfField bool
+	// IsOptional indicates whether the type is a optional field
+	IsOptional bool
 }

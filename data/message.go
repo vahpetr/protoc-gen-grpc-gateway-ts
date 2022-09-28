@@ -74,14 +74,18 @@ type Field struct {
 	OneOfIndex int32
 	// IsRepeated indicates whether the field is a repeated field
 	IsRepeated bool
+	// IsOptional indicates whether the field is a optional field
+	IsOptional bool
 }
 
 // GetType returns some information of the type to aid the rendering
 func (f *Field) GetType() *TypeInfo {
 	return &TypeInfo{
-		Type:       f.Type,
-		IsRepeated: f.IsRepeated,
-		IsExternal: f.IsExternal,
+		Type:         f.Type,
+		IsRepeated:   f.IsRepeated,
+		IsExternal:   f.IsExternal,
+		IsOneOfField: f.IsOneOfField,
+		IsOptional:   f.IsOptional,
 	}
 }
 
@@ -101,9 +105,11 @@ type MapEntryType struct {
 // GetType returns the type information for the type entry
 func (m *MapEntryType) GetType() *TypeInfo {
 	return &TypeInfo{
-		Type:       m.Type,
-		IsRepeated: false,
-		IsExternal: m.IsExternal,
+		Type:         m.Type,
+		IsRepeated:   false,
+		IsExternal:   m.IsExternal,
+		IsOneOfField: m.GetType().IsOneOfField,
+		IsOptional:   false,
 	}
 }
 

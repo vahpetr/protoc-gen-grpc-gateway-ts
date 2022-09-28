@@ -30,29 +30,16 @@ const tmpl = `
 }
 
 {{end}}{{end}}
-
 {{define "messages"}}{{range .}}
-{{- if .HasOneOfFields}}
-type Base{{.Name}} = {
-{{- range .NonOneOfFields}}
-  {{fieldName .Name}}?: {{tsType .}}
-{{- end}}
-}
-
-export type {{.Name}} = Base{{.Name}}
-{{range $groupId, $fields := .OneOfFieldsGroups}}  & OneOf<{ {{range $index, $field := $fields}}{{fieldName $field.Name}}: {{tsType $field}}{{if (lt (add $index 1) (len $fields))}}; {{end}}{{end}} }>
-{{end}}
-{{- else -}}
 export type {{.Name}} = {
 {{- range .Fields}}
-  {{fieldName .Name}}?: {{tsType .}}
+  {{fieldName .Name}}{{tsUndefined .}}: {{tsType .}}
 {{- end}}
 }
-{{end}}
 {{end}}{{end}}
 
 {{define "services"}}{{range .}}export class {{.Name}} {
-{{- range .Methods}}  
+{{- range .Methods}}
 {{- if .ServerStreaming }}
   static {{.Name}}(req: {{tsType .Input}}, entityNotifier?: fm.NotifyStreamEntityArrival<{{tsType .Output}}>, initReq?: fm.InitReq): Promise<void> {
     return fm.fetchStreamingRequest<{{tsType .Input}}, {{tsType .Output}}>(` + "`{{renderURL .}}`" + `, entityNotifier, {...initReq, {{buildInitReq .}}})
@@ -74,19 +61,10 @@ export type {{.Name}} = {
 * This file is a generated Typescript file for GRPC Gateway, DO NOT MODIFY
 */
 {{if .Dependencies}}{{- include "dependencies" .StableDependencies -}}{{end}}
-{{- if .NeedsOneOfSupport}}
-type Absent<T, K extends keyof T> = { [k in Exclude<keyof T, K>]?: undefined };
-type OneOf<T> =
-  | { [k in keyof T]?: undefined }
-  | (
-    keyof T extends infer K ?
-      (K extends string & keyof T ? { [k in K]: T[K] } & Absent<T, K>
-        : never)
-    : never);
-{{end}}
 {{- if .Enums}}{{include "enums" .Enums}}{{end}}
 {{- if .Messages}}{{include "messages" .Messages}}{{end}}
 {{- if .Services}}{{include "services" .Services}}{{end}}
+
 `
 
 const fetchTmpl = `
@@ -203,7 +181,7 @@ export interface InitReq extends RequestInit {
   pathPrefix?: string
 }
 
-export function replacer(key: any, value: any): any {
+export function replacer(_: any, value: any): any {
   if(value && value.constructor === Uint8Array) {
     return b64Encode(value, 0, value.length);
   }
@@ -211,7 +189,7 @@ export function replacer(key: any, value: any): any {
   return value;
 }
 
-export function fetchReq<I, O>(path: string, init?: InitReq): Promise<O> {
+export function fetchReq<T>(path: string, init?: InitReq): Promise<T> {
   const {pathPrefix, ...req} = init || {}
 
   const url = pathPrefix ? ` + "`${pathPrefix}${path}`" + ` : path
@@ -219,7 +197,22 @@ export function fetchReq<I, O>(path: string, init?: InitReq): Promise<O> {
   return fetch(url, req).then(r => r.json().then((body: O) => {
     if (!r.ok) { throw body; }
     return body;
-  })) as Promise<O>
+  })) as Promise<T>
+}
+
+export type ApiError = {
+  code: number
+  message: string
+  details: ApiErrorDetail[]
+}
+
+export type ApiErrorDetail = {
+  [key: string]: string
+}
+
+export type StreamResponse<T> = {
+  result?: T
+  error?: ApiError
 }
 
 // NotifyStreamEntityArrival is a callback that will be called on streaming entity arrival
@@ -230,7 +223,7 @@ export type NotifyStreamEntityArrival<T> = (resp: T) => void
  * it takes NotifyStreamEntityArrival that lets users respond to entity arrival during the call
  * all entities will be returned as an array after the call finishes.
  **/
-export async function fetchStreamingRequest<S, R>(path: string, callback?: NotifyStreamEntityArrival<R>, init?: InitReq) {
+export async function fetchStreamingRequest<T>(path: string, callback?: NotifyStreamEntityArrival<StreamResponse<T>>, init?: InitReq) {
   const {pathPrefix, ...req} = init || {}
   const url = pathPrefix ?` + "`${pathPrefix}${path}`" + ` : path
   const result = await fetch(url, req)
@@ -238,9 +231,11 @@ export async function fetchStreamingRequest<S, R>(path: string, callback?: Notif
   // http other than 200 will not throw an error, instead the .ok will become false.
   // see https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#
   if (!result.ok) {
-    const resp = await result.json()
-    const errMsg = resp.error && resp.error.message ? resp.error.message : ""
-    throw new Error(errMsg)
+    const response = await result.json()
+    const message = response.error && response.error.message
+      ? response.error.message
+      : ""
+    throw new Error(message)
   }
 
   if (!result.body) {
@@ -249,10 +244,10 @@ export async function fetchStreamingRequest<S, R>(path: string, callback?: Notif
 
   await result.body
     .pipeThrough(new TextDecoderStream())
-    .pipeThrough<R>(getNewLineDelimitedJSONDecodingStream<R>())
-    .pipeTo(getNotifyEntityArrivalSink((e: R) => {
+    .pipeThrough<StreamResponse<T>>(getNewLineDelimitedJSONDecodingStream<StreamResponse<T>>())
+    .pipeTo(getNotifyEntityArrivalSink((response: StreamResponse<T>) => {
       if (callback) {
-        callback(e)
+        callback(response)
       }
     }))
 
@@ -291,8 +286,10 @@ function getNewLineDelimitedJSONDecodingStream<T>(): TransformStream<string, T> 
       while (controller.pos < controller.buf.length) {
         if (controller.buf[controller.pos] === '\n') {
           const line = controller.buf.substring(0, controller.pos)
-          const response = JSON.parse(line)
-          controller.enqueue(response.result)
+          if (line != '[' && line != ',' && line != ']') {
+            const response = JSON.parse(line)
+            controller.enqueue(response)
+          }
           controller.buf = controller.buf.substring(controller.pos + 1)
           controller.pos = 0
         } else {
@@ -311,8 +308,8 @@ function getNewLineDelimitedJSONDecodingStream<T>(): TransformStream<string, T> 
  */
 function getNotifyEntityArrivalSink<T>(notifyCallback: NotifyStreamEntityArrival<T>) {
   return new WritableStream<T>({
-    write(entity: T) {
-      notifyCallback(entity)
+    write(response: T) {
+      notifyCallback(response)
     }
   })
 }
@@ -323,7 +320,7 @@ type FlattenedRequestPayload = Record<string, Primitive | Array<Primitive>>;
 
 /**
  * Checks if given value is a plain object
- * Logic copied and adapted from below source: 
+ * Logic copied and adapted from below source:
  * https://github.com/char0n/ramda-adjunct/blob/master/src/isPlainObj.js
  * @param  {unknown} value
  * @return {boolean}
@@ -433,6 +430,7 @@ export function renderURLSearchParams<T extends RequestPayload>(
 
   return new URLSearchParams(urlSearchParams).toString();
 }
+
 `
 
 // GetTemplate gets the templates to for the typescript file
@@ -448,6 +446,9 @@ func GetTemplate(r *registry.Registry) *template.Template {
 		"renderURL":    renderURL(r),
 		"buildInitReq": buildInitReq,
 		"fieldName":    fieldName(r),
+		"tsUndefined": func(fieldType data.Type) string {
+			return tsUndefined(r, fieldType)
+		},
 	})
 
 	t = template.Must(t.Parse(tmpl))
@@ -535,6 +536,14 @@ func include(t *template.Template) func(name string, data interface{}) (string, 
 	}
 }
 
+// check undefined
+func tsUndefined(r *registry.Registry, fieldType data.Type) string {
+	if fieldType.GetType().IsOneOfField {
+		return "?"
+	}
+	return ""
+}
+
 func tsType(r *registry.Registry, fieldType data.Type) string {
 	info := fieldType.GetType()
 	typeInfo, ok := r.Types[info.Type]
@@ -551,12 +560,17 @@ func tsType(r *registry.Registry, fieldType data.Type) string {
 	} else if !info.IsExternal {
 		typeStr = typeInfo.PackageIdentifier
 	} else {
-		typeStr = data.GetModuleName(typeInfo.Package, typeInfo.File) + "." + typeInfo.PackageIdentifier
+		typeStr = mapGoogleType(data.GetModuleName(typeInfo.Package, typeInfo.File) + "." + typeInfo.PackageIdentifier)
 	}
 
 	if info.IsRepeated {
 		typeStr += "[]"
 	}
+
+	if info.IsOptional || info.IsOneOfField {
+		typeStr += " | null"
+	}
+
 	return typeStr
 }
 
@@ -574,4 +588,27 @@ func mapScalaType(protoType string) string {
 
 	return ""
 
+}
+
+func mapGoogleType(protoType string) string {
+	switch protoType {
+	case
+		"GoogleProtobufTimestamp.Timestamp",
+		"GoogleProtobufWrappers.Int64Value",
+		"GoogleProtobufWrappers.UInt64Value",
+		"GoogleProtobufWrappers.StringValue",
+		"GoogleProtobufWrappers.BytesValue":
+		return "string"
+	case
+		"GoogleProtobufWrappers.DoubleValue",
+		"GoogleProtobufWrappers.Int32Value",
+		"GoogleProtobufWrappers.FloatValue",
+		"GoogleProtobufWrappers.UInt32Value":
+		return "number"
+	case
+		"GoogleProtobufWrappers.BoolValue":
+		return "boolean"
+	}
+
+	return protoType
 }

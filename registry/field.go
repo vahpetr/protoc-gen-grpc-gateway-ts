@@ -60,6 +60,7 @@ func (r *Registry) analyseField(fileData *data.File, msgData *data.Message, pack
 		IsExternal:   isExternal,
 		IsOneOfField: f.OneofIndex != nil,
 		Message:      msgData,
+		IsOptional:   f.GetProto3Optional(),
 	}
 
 	if f.Label != nil {
