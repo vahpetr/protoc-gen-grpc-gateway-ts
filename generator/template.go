@@ -38,15 +38,20 @@ export type {{.Name}} = {
 }
 {{end}}{{end}}
 
-{{define "services"}}{{range .}}export class {{.Name}} {
+{{define "services"}}{{range .}}
+export class {{.Name}}Client {
+  constructor(protected _host, protected _token) {}
+  public set token(token: string) {
+    this._token = token
+  }
 {{- range .Methods}}
 {{- if .ServerStreaming }}
-  static {{.Name}}(req: {{tsType .Input}}, entityNotifier?: fm.NotifyStreamEntityArrival<{{tsType .Output}}>, initReq?: fm.InitReq): Promise<void> {
-    return fm.fetchStreamingRequest<{{tsType .Input}}, {{tsType .Output}}>(` + "`{{renderURL .}}`" + `, entityNotifier, {...initReq, {{buildInitReq .}}})
+  {{.Name}} = (req: {{tsType .Input}}, next?: fm.StreamNext<{{tsType .Output}}>, init?: RequestInit): Promise<void> => {
+    return fm.stream<{{tsType .Input}}, {{tsType .Output}}>(` + "`${this._host}{{renderURL .}}`" + `, next, {...init, {{buildInitReq .}}, ...{ headers: { ...init?.headers, ...{ 'Authorization': ` + "`Bearer ${this._token}`" + ` } } }})
   }
 {{- else }}
-  static {{.Name}}(req: {{tsType .Input}}, initReq?: fm.InitReq): Promise<{{tsType .Output}}> {
-    return fm.fetchReq<{{tsType .Input}}, {{tsType .Output}}>(` + "`{{renderURL .}}`" + `, {...initReq, {{buildInitReq .}}})
+  {{.Name}} = (req: {{tsType .Input}}, init?: RequestInit): Promise<{{tsType .Output}}> => {
+    return fm.request<{{tsType .Input}}, {{tsType .Output}}>(` + "`${this._host}{{renderURL .}}`" + `, {...init, {{buildInitReq .}}, ...{ headers: { ...init?.headers, ...{ 'Authorization': ` + "`Bearer ${this._token}`" + ` } } } })
   }
 {{- end}}
 {{- end}}
@@ -173,31 +178,31 @@ export function b64Decode(s: string): Uint8Array {
   return new Uint8Array(buffer);
 }
 
-function b64Test(s: string): boolean {
-	return /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(s);
-}
-
-export interface InitReq extends RequestInit {
-  pathPrefix?: string
-}
-
 export function replacer(_: any, value: any): any {
-  if(value && value.constructor === Uint8Array) {
+  if (value && value.constructor === Uint8Array) {
     return b64Encode(value, 0, value.length);
   }
 
   return value;
 }
 
-export function fetchReq<T>(path: string, init?: InitReq): Promise<T> {
-  const {pathPrefix, ...req} = init || {}
+export async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
+  const result = await fetch<T>(input, init)
+  if (!result.ok) {
+    const response = await result.json()
+    const message = response.error && response.error.message
+      ? response.error.message
+      : response
+    throw new Error(message)
+  }
 
-  const url = pathPrefix ? ` + "`${pathPrefix}${path}`" + ` : path
+  if (!result.body) {
+    return;
+  }
 
-  return fetch(url, req).then(r => r.json().then((body: O) => {
-    if (!r.ok) { throw body; }
-    return body;
-  })) as Promise<T>
+  const response = await result.json()
+
+  return response;
 }
 
 export type ApiError = {
@@ -215,67 +220,47 @@ export type StreamResponse<T> = {
   error?: ApiError
 }
 
-// NotifyStreamEntityArrival is a callback that will be called on streaming entity arrival
-export type NotifyStreamEntityArrival<T> = (resp: T) => void
+export type StreamNext<T> = (response: StreamResponse<T>) => void
 
-/**
- * fetchStreamingRequest is able to handle grpc-gateway server side streaming call
- * it takes NotifyStreamEntityArrival that lets users respond to entity arrival during the call
- * all entities will be returned as an array after the call finishes.
- **/
-export async function fetchStreamingRequest<T>(path: string, callback?: NotifyStreamEntityArrival<StreamResponse<T>>, init?: InitReq) {
-  const {pathPrefix, ...req} = init || {}
-  const url = pathPrefix ?` + "`${pathPrefix}${path}`" + ` : path
-  const result = await fetch(url, req)
-  // needs to use the .ok to check the status of HTTP status code
-  // http other than 200 will not throw an error, instead the .ok will become false.
-  // see https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#
+export async function stream<T>(input: RequestInfo | URL, next?: StreamNext<T>, init?: RequestInit) {
+  const result = await fetch(input, init)
   if (!result.ok) {
     const response = await result.json()
     const message = response.error && response.error.message
       ? response.error.message
-      : ""
+      : response
     throw new Error(message)
   }
 
   if (!result.body) {
-    throw new Error("response doesnt have a body")
+    return;
   }
 
-  await result.body
-    .pipeThrough(new TextDecoderStream())
-    .pipeThrough<StreamResponse<T>>(getNewLineDelimitedJSONDecodingStream<StreamResponse<T>>())
-    .pipeTo(getNotifyEntityArrivalSink((response: StreamResponse<T>) => {
-      if (callback) {
-        callback(response)
-      }
-    }))
+  const textDecoderStream = new TextDecoderStream()
+  const jsonDecoderStream = CreateJsonDecoderStream<StreamResponse<T>>(next)
+  // const nextWritableStream = NextWritableStream(next)
 
-  // wait for the streaming to finish and return the success respond
-  return
+  await result.body
+      .pipeThrough(textDecoderStream)
+      .pipeThrough<StreamResponse<T>>(jsonDecoderStream)
+      // .pipeTo(nextWritableStream)
+      .pipeTo(new WritableStream())
 }
 
-/**
- * JSONStringStreamController represents the transform controller that's able to transform the incoming
- * new line delimited json content stream into entities and able to push the entity to the down stream
- */
-interface JSONStringStreamController<T> extends TransformStreamDefaultController {
+interface JsonStringStreamController<T> extends TransformStreamDefaultController {
   buf?: string
   pos?: number
-  enqueue: (s: T) => void
+  enqueue: (response: T) => void
 }
 
-/**
- * getNewLineDelimitedJSONDecodingStream returns a TransformStream that's able to handle new line delimited json stream content into parsed entities
- */
-function getNewLineDelimitedJSONDecodingStream<T>(): TransformStream<string, T> {
+function CreateJsonDecoderStream<T>(next: StreamNext<T>): TransformStream<string, T> {
   return new TransformStream({
-    start(controller: JSONStringStreamController<T>) {
+    start(controller: JsonStringStreamController<T>) {
       controller.buf = ''
       controller.pos = 0
     },
 
-    transform(chunk: string, controller: JSONStringStreamController<T>) {
+    transform(chunk: string, controller: JsonStringStreamController<T>) {
       if (controller.buf === undefined) {
         controller.buf = ''
       }
@@ -288,7 +273,8 @@ function getNewLineDelimitedJSONDecodingStream<T>(): TransformStream<string, T> 
           const line = controller.buf.substring(0, controller.pos)
           if (line != '[' && line != ',' && line != ']') {
             const response = JSON.parse(line)
-            controller.enqueue(response)
+            // controller.enqueue(response)
+            next && next(response)
           }
           controller.buf = controller.buf.substring(controller.pos + 1)
           controller.pos = 0
@@ -298,21 +284,15 @@ function getNewLineDelimitedJSONDecodingStream<T>(): TransformStream<string, T> 
       }
     }
   })
-
 }
 
-/**
- * getNotifyEntityArrivalSink takes the NotifyStreamEntityArrival callback and return
- * a sink that will call the callback on entity arrival
- * @param notifyCallback
- */
-function getNotifyEntityArrivalSink<T>(notifyCallback: NotifyStreamEntityArrival<T>) {
-  return new WritableStream<T>({
-    write(response: T) {
-      notifyCallback(response)
-    }
-  })
-}
+// function CallbackWritableStream<T>(next: StreamNext<T>) {
+//   return new WritableStream<T>({
+//     write(response: T) {
+//       next && next(response)
+//     }
+//   })
+// }
 
 type Primitive = string | boolean | number;
 type RequestPayload = Record<string, unknown>;
@@ -367,7 +347,7 @@ function isZeroValuePrimitive(value: Primitive): boolean {
  * as per https://github.com/googleapis/googleapis/blob/master/google/api/http.proto
  * @param  {RequestPayload} requestPayload
  * @param  {String} path
- * @return {FlattenedRequestPayload>}
+ * @return {FlattenedRequestPayload}
  */
 function flattenRequestPayload<T extends RequestPayload>(
   requestPayload: T,
@@ -400,15 +380,7 @@ function flattenRequestPayload<T extends RequestPayload>(
   ) as FlattenedRequestPayload;
 }
 
-/**
- * Renders a deeply nested request payload into a string of URL search
- * parameters by first flattening the request payload and then removing keys
- * which are already present in the URL path.
- * @param  {RequestPayload} requestPayload
- * @param  {string[]} urlPathParams
- * @return {string}
- */
-export function renderURLSearchParams<T extends RequestPayload>(
+export function buildQuery<T extends RequestPayload>(
   requestPayload: T,
   urlPathParams: string[] = []
 ): string {
@@ -422,13 +394,14 @@ export function renderURLSearchParams<T extends RequestPayload>(
         return acc;
       }
       return Array.isArray(value)
-        ? [...acc, ...value.map(m => [key, m.toString()])]
+        ? [...acc, ...value.map(p => [key, p.toString()])]
         : (acc = [...acc, [key, value.toString()]]);
     },
     [] as string[][]
   );
 
-  return new URLSearchParams(urlSearchParams).toString();
+  const query = new URLSearchParams(urlSearchParams).toString();
+  return query ? ("?" + query) : ""
 }
 
 `
@@ -490,13 +463,19 @@ func renderURL(r *registry.Registry) func(method data.Method) string {
 			if err != nil {
 				return methodURL
 			}
-			renderURLSearchParamsFn := fmt.Sprintf("${fm.renderURLSearchParams(req, %s)}", urlPathParams)
+			var buildQueryFn string
+			if urlPathParams != "[]" {
+				buildQueryFn = fmt.Sprintf("${fm.buildQuery(req, %s)}", urlPathParams)
+			} else {
+				buildQueryFn = "${fm.buildQuery(req)}"
+			}
+
 			// prepend "&" if query string is present otherwise prepend "?"
 			// trim leading "&" if present before prepending it
 			if parsedURL.RawQuery != "" {
-				methodURL = strings.TrimRight(methodURL, "&") + "&" + renderURLSearchParamsFn
+				methodURL = strings.TrimRight(methodURL, "&") + "&" + buildQueryFn
 			} else {
-				methodURL += "?" + renderURLSearchParamsFn
+				methodURL += buildQueryFn
 			}
 		}
 
